@@ -12,6 +12,10 @@
 (define-constant ERR_INVALID_RATING (err u110))
 (define-constant ERR_COMMISSION_NOT_COMPLETE (err u111))
 (define-constant ERR_RATING_NOT_FOUND (err u112))
+(define-constant ERR_TEMPLATE_NOT_FOUND (err u113))
+(define-constant ERR_TEMPLATE_NOT_ACTIVE (err u114))
+(define-constant ERR_INVALID_CATEGORY (err u115))
+(define-constant ERR_INVALID_DURATION (err u116))
 
 (define-constant STATUS_PENDING u0)
 (define-constant STATUS_IN_PROGRESS u1)
@@ -21,6 +25,7 @@
 (define-constant STATUS_REFUNDED u5)
 
 (define-data-var commission-counter uint u0)
+(define-data-var template-counter uint u0)
 
 (define-map commissions
   { commission-id: uint }
@@ -78,6 +83,32 @@
     two-star: uint,
     one-star: uint
   }
+)
+
+(define-map commission-templates
+  { template-id: uint }
+  {
+    artist: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    category: uint,
+    base-price: uint,
+    duration-blocks: uint,
+    terms: (string-ascii 300),
+    is-active: bool,
+    created-at: uint,
+    usage-count: uint
+  }
+)
+
+(define-map artist-templates
+  { artist: principal }
+  { template-ids: (list 20 uint) }
+)
+
+(define-map category-templates
+  { category: uint }
+  { template-ids: (list 50 uint) }
 )
 
 (define-public (create-commission (artist principal) (amount uint) (deadline uint) (description (string-ascii 500)))
@@ -508,6 +539,169 @@
   )
 )
 
+(define-public (create-commission-template (title (string-ascii 100)) (description (string-ascii 500)) (category uint) (base-price uint) (duration-blocks uint) (terms (string-ascii 300)))
+  (let
+    (
+      (template-id (+ (var-get template-counter) u1))
+      (artist tx-sender)
+    )
+    (asserts! (> base-price u0) ERR_INVALID_AMOUNT)
+    (asserts! (> duration-blocks u0) ERR_INVALID_DURATION)
+    (asserts! (<= category u10) ERR_INVALID_CATEGORY)
+    
+    (map-set commission-templates
+      { template-id: template-id }
+      {
+        artist: artist,
+        title: title,
+        description: description,
+        category: category,
+        base-price: base-price,
+        duration-blocks: duration-blocks,
+        terms: terms,
+        is-active: true,
+        created-at: stacks-block-height,
+        usage-count: u0
+      }
+    )
+    
+    (update-artist-templates artist template-id)
+    (update-category-templates category template-id)
+    
+    (var-set template-counter template-id)
+    (ok template-id)
+  )
+)
+
+(define-public (create-commission-from-template (template-id uint))
+  (let
+    (
+      (template (unwrap! (map-get? commission-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+      (artist (get artist template))
+      (amount (get base-price template))
+      (deadline (+ stacks-block-height (get duration-blocks template)))
+      (description (get description template))
+    )
+    (asserts! (get is-active template) ERR_TEMPLATE_NOT_ACTIVE)
+    (asserts! (not (is-eq tx-sender artist)) ERR_NOT_AUTHORIZED)
+    
+    (increment-template-usage template-id)
+    (create-commission artist amount deadline description)
+  )
+)
+
+(define-public (toggle-template-status (template-id uint))
+  (let
+    (
+      (template (unwrap! (map-get? commission-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get artist template)) ERR_NOT_AUTHORIZED)
+    
+    (map-set commission-templates
+      { template-id: template-id }
+      (merge template { is-active: (not (get is-active template)) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-template-price (template-id uint) (new-price uint))
+  (let
+    (
+      (template (unwrap! (map-get? commission-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get artist template)) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-price u0) ERR_INVALID_AMOUNT)
+    
+    (map-set commission-templates
+      { template-id: template-id }
+      (merge template { base-price: new-price })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-commission-template (template-id uint))
+  (map-get? commission-templates { template-id: template-id })
+)
+
+(define-read-only (get-artist-templates (artist principal))
+  (default-to { template-ids: (list) } (map-get? artist-templates { artist: artist }))
+)
+
+(define-read-only (get-category-templates (category uint))
+  (default-to { template-ids: (list) } (map-get? category-templates { category: category }))
+)
+
+(define-read-only (get-active-templates-by-artist (artist principal))
+  (let
+    (
+      (artist-template-data (get-artist-templates artist))
+      (template-ids (get template-ids artist-template-data))
+    )
+    (filter is-template-active template-ids)
+  )
+)
+
+(define-read-only (get-template-count)
+  (var-get template-counter)
+)
+
+(define-read-only (get-template-stats (template-id uint))
+  (match (map-get? commission-templates { template-id: template-id })
+    template (ok {
+      usage-count: (get usage-count template),
+      is-active: (get is-active template),
+      created-at: (get created-at template),
+      base-price: (get base-price template)
+    })
+    ERR_TEMPLATE_NOT_FOUND
+  )
+)
+
+(define-read-only (is-template-active (template-id uint))
+  (match (map-get? commission-templates { template-id: template-id })
+    template (get is-active template)
+    false
+  )
+)
+
+(define-private (increment-template-usage (template-id uint))
+  (let
+    (
+      (template (unwrap-panic (map-get? commission-templates { template-id: template-id })))
+    )
+    (map-set commission-templates
+      { template-id: template-id }
+      (merge template { usage-count: (+ (get usage-count template) u1) })
+    )
+  )
+)
+
+(define-private (update-artist-templates (artist principal) (template-id uint))
+  (let
+    (
+      (current-templates (get template-ids (get-artist-templates artist)))
+    )
+    (map-set artist-templates
+      { artist: artist }
+      { template-ids: (unwrap-panic (as-max-len? (append current-templates template-id) u20)) }
+    )
+  )
+)
+
+(define-private (update-category-templates (category uint) (template-id uint))
+  (let
+    (
+      (current-templates (get template-ids (get-category-templates category)))
+    )
+    (map-set category-templates
+      { category: category }
+      { template-ids: (unwrap-panic (as-max-len? (append current-templates template-id) u50)) }
+    )
+  )
+)
+
 (define-private (update-user-commissions (user principal) (commission-id uint))
   (let
     (
@@ -519,3 +713,6 @@
     )
   )
 )
+
+
+
